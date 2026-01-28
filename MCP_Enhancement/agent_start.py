@@ -6,10 +6,9 @@ from typing import Optional, List, Dict
 
 # Environment & Server
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
-from slack_sdk.errors import SlackApiError
 
 # Load environment variables
 load_dotenv()
@@ -18,18 +17,18 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Slack Bolt App (The Listener)
+# Initialize Slack Bolt App
 slack_app = AsyncApp(
     token=os.environ.get("SLACK_BOT_TOKEN"),
     signing_secret=os.environ.get("SLACK_SIGNING_SECRET")
 )
 app_handler = AsyncSlackRequestHandler(slack_app)
 
-# Initialize FastAPI (The Web Server)
+# Initialize FastAPI
 api = FastAPI()
 
 
-# --- HELPER FUNCTIONS (From Phase 1) ---
+# --- HELPER FUNCTIONS ---
 
 def get_jira_auth():
     """Returns the tuple for Basic Auth (Email, Token)."""
@@ -38,8 +37,7 @@ def get_jira_auth():
 
 def parse_adf_text(adf_node):
     """Helper to recursively extract all plain text from Jira's ADF format."""
-    if not adf_node:
-        return ""
+    if not adf_node: return ""
     texts = []
     if isinstance(adf_node, dict):
         if adf_node.get("type") == "text":
@@ -53,29 +51,28 @@ def parse_adf_text(adf_node):
     return " ".join(filter(None, texts))
 
 
+def extract_jira_keys(text: str) -> List[str]:
+    """Finds unique Jira keys (e.g., MIFOS-123, WEB-45) in a string."""
+    if not text:
+        return []
+    # Pattern: Uppercase letters, hyphen, numbers
+    return list(set(re.findall(r"([A-Z]+-\d+)", text)))
+
+
 def _create_block_kit_summary(title: str, content: str) -> List[Dict]:
     """Helper to build a professional Slack UI message."""
     return [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": f"📄 {title}"}
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": content}
-        },
+        {"type": "header", "text": {"type": "plain_text", "text": f"📄 {title}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": content}},
         {"type": "divider"},
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": "*Source: Mifos Enhancement Agent | Phase 2 Listener*"}]
-        }
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": "*Source: Mifos Watchdog Agent*"}]}
     ]
 
 
-# --- CORE LOGIC (The Tools) ---
+# --- JIRA TOOLS (Phase 1 & 2) ---
 
 async def get_jira_ticket_details(ticket_key: str):
-    """Fetches Jira ticket summary, description, AND comments with duplicate filter."""
+    """Fetches Jira ticket summary, description, AND recent comments."""
     jira_url = os.getenv("JIRA_URL")
     if not jira_url: return "❌ Error: JIRA_URL not set."
 
@@ -91,28 +88,23 @@ async def get_jira_ticket_details(ticket_key: str):
         summary = fields.get("summary", "No Summary")
         description = parse_adf_text(fields.get("description")) or "No Description"
 
-        # Comments with Duplicate Filter
+        # Comments Logic
         comments_data = fields.get("comment", {}).get("comments", [])
         comments_text = []
-        seen_comments = set()
-
+        seen = set()
         for c in comments_data:
-            author = c.get("author", {}).get("displayName", "Unknown")
             body = parse_adf_text(c.get("body")).strip()
+            if body and body not in seen:
+                comments_text.append(f"- {body[:100]}...")  # Truncate for brevity
+                seen.add(body)
 
-            if body and body not in seen_comments:
-                comments_text.append(f"- *{author}*: {body}")
-                seen_comments.add(body)
-
-        discussion = "\n".join(
-            comments_text[-5:]) if comments_text else "No comments found."  # Limit to last 5 for brevity
+        discussion = "\n".join(comments_text[-3:]) if comments_text else "No recent comments."
 
         return (
             f"*Summary:* {summary}\n"
-            f"*Description:* {description[:200]}...\n\n"
+            f"*Description:* {description[:300]}...\n"  # Truncate for Slack
             f"*Recent Discussion:*\n{discussion}"
         )
-
     except Exception as e:
         return f"❌ Exception reading Jira: {str(e)}"
 
@@ -121,77 +113,121 @@ async def check_jira_for_ui_assets(ticket_key: str):
     """Checks for UI screenshots in Jira."""
     jira_url = os.getenv("JIRA_URL")
     url = f"{jira_url}/rest/api/3/issue/{ticket_key}?fields=attachment"
-
     try:
         resp = requests.get(url, auth=get_jira_auth())
         data = resp.json()
         attachments = data.get("fields", {}).get("attachment", [])
-
-        image_list = []
-        for a in attachments:
-            if a['mimeType'].startswith('image/'):
-                image_list.append(f"• <{a['content']}|{a['filename']}>")
-
-        if not image_list:
-            return "No UI screenshots found."
-        return "\n".join(image_list)
+        images = [f"• <{a['content']}|{a['filename']}>" for a in attachments if a['mimeType'].startswith('image/')]
+        return "\n".join(images) if images else "No UI screenshots found."
     except Exception:
         return "Error checking assets."
 
 
-# --- SLACK EVENT LISTENERS (The "Brain" of Phase 2) ---
+# --- PHASE 3: GITHUB WATCHDOG LOGIC ---
+
+async def process_github_pr(payload: Dict):
+    """
+    1. Extracts PR details.
+    2. Finds Jira Key.
+    3. Fetches Jira Data.
+    4. Posts Alert to Slack.
+    """
+    pr = payload.get("pull_request", {})
+    pr_number = pr.get("number")
+    pr_title = pr.get("title", "")
+    pr_body = pr.get("body", "") or ""
+    pr_url = pr.get("html_url")
+    author = pr.get("user", {}).get("login", "Unknown")
+
+    # 1. Identify Jira Ticket
+    full_text = f"{pr_title} {pr_body}"
+    jira_keys = extract_jira_keys(full_text)
+
+    channel_id = os.getenv("SLACK_ALERT_CHANNEL_ID")
+    if not channel_id:
+        logger.warning("SLACK_ALERT_CHANNEL_ID not set. Skipping notification.")
+        return
+
+    # 2. Logic: If Jira Key found, fetch details. If not, Warn.
+    if jira_keys:
+        ticket_key = jira_keys[0]  # Take the first one found
+        jira_info = await get_jira_ticket_details(ticket_key)
+
+        msg_text = (
+            f"👀 *Watchdog Alert:* New PR #{pr_number} by {author}\n"
+            f"🔗 <{pr_url}|{pr_title}>\n\n"
+            f"✅ *Linked Jira Ticket:* `{ticket_key}`\n"
+            f"{jira_info}"
+        )
+    else:
+        msg_text = (
+            f"⚠️ *Watchdog Warning:* New PR #{pr_number} by {author}\n"
+            f"🔗 <{pr_url}|{pr_title}>\n\n"
+            f"❌ *No Jira Ticket Detected!*\n"
+            f"Please ensure the PR description includes a valid ticket key (e.g., MIFOS-123)."
+        )
+
+    # 3. Post to Slack
+    await slack_app.client.chat_postMessage(
+        channel=channel_id,
+        text=f"Watchdog Update: PR #{pr_number}",
+        blocks=_create_block_kit_summary(f"GitHub PR #{pr_number} Analysis", msg_text)
+    )
+
+
+# --- API ENDPOINTS ---
+
+@api.post("/slack/events")
+async def slack_endpoint(req: Request):
+    """Handles Slack Events (Mentions)."""
+    return await app_handler.handle(req)
+
+
+@api.post("/github/webhook")
+async def github_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """
+    Handles GitHub Webhooks.
+    Triggers the Watchdog agent in the background to avoid timeouts.
+    """
+    payload = await request.json()
+    event_type = request.headers.get("X-GitHub-Event")
+
+    # Only react to Pull Requests that are opened or edited
+    if event_type == "pull_request":
+        action = payload.get("action")
+        if action in ["opened", "edited", "synchronize"]:
+            logger.info(f"Received GitHub PR Event: {action}")
+            # Run processing in background so GitHub gets a 200 OK immediately
+            background_tasks.add_task(process_github_pr, payload)
+
+    return {"status": "received"}
+
+
+# --- SLACK HANDLERS (Manual Trigger) ---
 
 @slack_app.event("app_mention")
 async def handle_mentions(body, say):
-    """
-    Trigger: When user types '@Mifos-Enhancement-Agent check WEB-95'
-    Action: Runs the Librarian tools and replies in the thread.
-    """
     text = body["event"]["text"]
-    user = body["event"]["user"]
-
-    # Simple Greeting
-    if "hello" in text.lower():
-        await say(
-            f"👋 Hello <@{user}>! I am the Mifos Enhancement Agent. Mention me with a Ticket ID (like WEB-95) to get a summary.")
-        return
-
-    # Extract Ticket ID (Look for pattern like WEB-123 or MIFOSX-123)
     match = re.search(r"([A-Z]+-\d+)", text)
     if match:
         ticket_key = match.group(1)
-        await say(f"🔍 Acknowledgement: Checking Jira for *{ticket_key}*...")
-
-        # Run Tools
+        await say(f"🔍 Checking Jira for *{ticket_key}*...")
         details = await get_jira_ticket_details(ticket_key)
         assets = await check_jira_for_ui_assets(ticket_key)
-
-        # Format and Send
-        final_text = f"{details}\n\n*UI Assets:*\n{assets}"
-        blocks = _create_block_kit_summary(f"Librarian Report: {ticket_key}", final_text)
-
+        blocks = _create_block_kit_summary(f"Librarian Report: {ticket_key}", f"{details}\n\n*UI Assets:*\n{assets}")
         await say(blocks=blocks, text=f"Report for {ticket_key}")
     else:
-        await say("❓ I didn't see a valid Ticket ID (e.g., WEB-95) in your message.")
+        await say(
+            "👋 I am the Watchdog. I listen for PRs automatically, but you can mention me with a Ticket ID to look it up manually.")
 
 
 @slack_app.event("message")
 async def handle_message_events(body, logger):
-    """Log messages for debugging (but don't reply unless mentioned)."""
     logger.info(body)
-
-
-# --- FASTAPI SERVER ---
-
-@api.post("/slack/events")
-async def endpoint(req: Request):
-    """The endpoint that Slack hits (via ngrok)."""
-    return await app_handler.handle(req)
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    # Run the web server on port 3000
-    print("⚡️ Mifos Agent is listening on port 3000...")
+    print("⚡️ Mifos Phase 3 Watchdog is listening on port 3000...")
     uvicorn.run(api, host="0.0.0.0", port=3000)

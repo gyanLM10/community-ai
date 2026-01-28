@@ -106,3 +106,6 @@ if __name__ == "__main__":
         print("🚀 All services configured and ready.")
     except Exception as e:
         print(f"❌ Configuration failed: {e}")
+
+
+        #phase 3 testing
