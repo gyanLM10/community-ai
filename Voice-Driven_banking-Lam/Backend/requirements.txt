@@ -12,4 +12,3 @@ soundfile  # To handle audio files (used by torchaudio and some HF pipelines)
 numpy  # For numerical operations (e.g., cosine similarity)
 librosa
 google-generativeai
-sarvamai
